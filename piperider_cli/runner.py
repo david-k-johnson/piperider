@@ -1,3 +1,4 @@
+from collections import defaultdict
 import json
 import math
 import os
@@ -7,6 +8,7 @@ import sys
 import uuid
 from datetime import datetime
 
+from deepmerge import always_merger
 from rich import box
 from rich.color import Color
 from rich.console import Console
@@ -526,7 +528,7 @@ def _check_test_status(assertion_results, assertion_exceptions, dbt_test_results
 class Runner():
     @staticmethod
     def exec(datasource=None, table=None, output=None, skip_report=False, dbt_state_dir: str = None,
-             report_dir: str = None):
+             report_dir: str = None, only: str = None, filter: str = None):
         console = Console()
 
         raise_exception_when_directory_not_writable(output)
@@ -552,59 +554,9 @@ class Runner():
         ds_name = datasource if datasource else datasource_names[0]
         ds = datasources[ds_name]
 
-        passed, reasons = ds.validate()
-        if not passed:
-            console.print(f"[bold red]Error:[/bold red] The credential of '{ds.name}' is not configured.")
-            for reason in reasons:
-                console.print(f'    {reason}')
-            console.print(
-                "[bold yellow]Hint:[/bold yellow]\n  Please execute command 'piperider init' to move forward.")
-            return 1
-
-        if not datasource and len(datasource_names) > 1:
-            console.print(
-                f"[bold yellow]Warning: multiple datasources found ({', '.join(datasource_names)}), using '{ds_name}'[/bold yellow]\n")
-
-        console.print(f'[bold dark_orange]DataSource:[/bold dark_orange] {ds.name}')
-        console.rule('Validating')
-        err = ds.verify_connector()
-        if err:
-            console.print(
-                f'[[bold red]FAILED[/bold red]] Failed to load the \'{ds.type_name}\' connector.')
-            raise err
-
-        try:
-            available_tables = ds.verify_connection()
-        except Exception as err:
-            console.print(
-                f'[[bold red]FAILED[/bold red]] Failed to connect the \'{ds.name}\' data source.')
-            raise err
-        stop_runner = _validate_assertions(console)
-        if stop_runner:
-            console.print('\n\n[bold red]ERROR:[/bold red] Stop profiling, please fix the syntax errors above.')
-            return 1
-
-        dbt_config = ds.args.get('dbt')
-
-        if dbt_config and not dbtutil.is_ready(dbt_config):
-            console.log('[bold red]ERROR:[/bold red] DBT configuration is not completed, please check the config.yml')
-            return 1
-
-        console.rule('Profiling')
-        run_id = uuid.uuid4().hex
-        created_at = datetime.utcnow()
-        engine = ds.create_engine()
-        default_schema = ds.credential.get('schema')
-
-        if default_schema is None and ds.type_name == 'bigquery':
-            default_schema = ds.credential.get('dataset')
-
-        if default_schema is None:
-            inspector = inspect(engine)
-            default_schema = inspector.default_schema_name
-
         tables = None
         dbt_test_results = None
+        datasources_to_tables = {ds: None}
         if dbt_state_dir:
             if not dbtutil.is_dbt_state_ready(dbt_state_dir):
                 console.print(
@@ -615,33 +567,126 @@ class Runner():
                                                      configuration.includes, configuration.excludes)
             dbt_test_results = dbtutil.get_dbt_state_tests_result(dbt_state_dir)
 
-        if table:
-            if len(table.split('.')) == 2:
-                schema, table_name = table.split('.')
-                tables = [ProfileSubject(table_name, schema, table_name)]
-            else:
-                tables = [ProfileSubject(table, default_schema, table)]
-            # cli --table is specified, no inclusion and exclusion applied
-            configuration.includes = None
-            configuration.excludes = None
+            grouped_tables = defaultdict(lambda: defaultdict(lambda: list()))
+            for table_ in tables:
+                grouped_tables[table_.database][table_.schema].append(table_)
+            datasources_to_tables = {
+                ds.__class__(
+                    name=f"{ds.name}.{db}.{schema}",
+                    credential={
+                        **ds.credential,
+                        **{"database": db, "schema": schema}
+                    }
+                ): tables
+                for (db, schema_tables) in grouped_tables.items()
+                for (schema, tables) in schema_tables.items()
+            }
 
-        run_result = {}
-        available_tables = [t.table for t in tables] if tables else available_tables
-        profiler = Profiler(engine, RichProfilerEventHandler(available_tables), configuration)
-        try:
-            profiler_result = profiler.profile(tables)
-            run_result.update(profiler_result)
-        except NoSuchTableError as e:
-            console.print(f"[bold red]Error:[/bold red] No such table '{str(e)}'")
-            return 1
-        except Exception as e:
-            raise Exception(f'Profiler Exception: {type(e).__name__}(\'{e}\')')
+        overall_run_results = {}
+        overall_assertion_results = []
+        overall_assertion_exceptions = []
+        for ds_, tables in datasources_to_tables.items():
+            run_result = {'tables': {}, 'tests': []}
+            assertion_results = []
+            assertion_exceptions = []
 
-        # TODO: refactor input unused arguments
-        assertion_results, assertion_exceptions = _execute_assertions(console, engine, ds.name, output,
-                                                                      profiler_result, created_at)
+            default_schema = ds_.credential.get('schema')
+            if table:
+                if len(table.split('.')) == 2:
+                    schema, table_name = table.split('.')
+                    tables = [ProfileSubject(table_name, schema, table_name)]
+                else:
+                    tables = [ProfileSubject(table, default_schema, table)]
+                # cli --table is specified, no inclusion and exclusion applied
+                configuration.includes = None
+                configuration.excludes = None
 
-        run_result['tests'] = []
+            if only:
+                p = re.compile(only)
+                tables = [s for s in tables if p.match(s.table)]
+
+            if filter:
+                p = re.compile(filter)
+                tables = [s for s in tables if not p.match(s.table)]
+
+            if not tables:
+                continue
+
+            passed, reasons = ds_.validate()
+            if not passed:
+                console.print(f"[bold red]Error:[/bold red] The credential of '{ds_.name}' is not configured.")
+                for reason in reasons:
+                    console.print(f'    {reason}')
+                console.print(
+                    "[bold yellow]Hint:[/bold yellow]\n  Please execute command 'piperider init' to move forward.")
+                return 1
+
+            if not datasource and len(datasource_names) > 1:
+                console.print(
+                    f"[bold yellow]Warning: multiple datasources found ({', '.join(datasource_names)}), using '{ds_.name}'[/bold yellow]\n")
+
+            console.print(f'[bold dark_orange]DataSource:[/bold dark_orange] {ds_.name}')
+            console.rule('Validating')
+            err = ds_.verify_connector()
+            if err:
+                console.print(
+                    f'[[bold red]FAILED[/bold red]] Failed to load the \'{ds_.type_name}\' connector.')
+                raise err
+
+            try:
+                available_tables = ds_.verify_connection(configuration.include_views)
+            except Exception as err:
+                console.print(
+                    f'[[bold red]FAILED[/bold red]] Failed to connect the \'{ds_.name}\' data source.')
+                raise err
+            stop_runner = _validate_assertions(console)
+            if stop_runner:
+                console.print('\n\n[bold red]ERROR:[/bold red] Stop profiling, please fix the syntax errors above.')
+                return 1
+
+            dbt_config = ds_.args.get('dbt')
+
+            if dbt_config and not dbtutil.is_ready(dbt_config):
+                console.log('[bold red]ERROR:[/bold red] DBT configuration is not completed, please check the config.yml')
+                return 1
+
+            console.rule('Profiling')
+            run_id = uuid.uuid4().hex
+            created_at = datetime.utcnow()
+            engine = ds_.create_engine()
+
+            if default_schema is None and ds_.type_name == 'bigquery':
+                default_schema = ds_.credential.get('dataset')
+
+            if default_schema is None:
+                inspector = inspect(engine)
+                default_schema = inspector.default_schema_name
+
+            available_tables = [t.table for t in tables] if tables else available_tables
+            profiler = Profiler(engine, RichProfilerEventHandler(available_tables), configuration)
+            try:
+                profiler_result = profiler.profile(tables)
+                run_result.update(profiler_result)
+            except NoSuchTableError as e:
+                console.print(f"[bold red]Error:[/bold red] No such table '{str(e)}'")
+                return 1
+            except Exception as e:
+                raise Exception(f'Profiler Exception: {type(e).__name__}(\'{e}\')')
+
+            # TODO: refactor input unused arguments
+            assertion_results, assertion_exceptions = _execute_assertions(
+                console,
+                engine,
+                ds_.name,
+                output,
+                profiler_result,
+                created_at
+            )
+
+            overall_run_results = always_merger.merge(run_result, overall_run_results)
+            overall_assertion_results.extend(assertion_results)
+            overall_assertion_exceptions.extend(assertion_exceptions)
+
         if assertion_results or dbt_test_results:
             console.rule('Assertion Results')
             if dbt_test_results:
@@ -669,16 +714,16 @@ class Runner():
             dbtutil.append_descriptions(run_result, dbt_state_dir)
         _append_descriptions_from_assertion(run_result)
 
-        run_result['id'] = run_id
-        run_result['created_at'] = datetime_to_str(created_at)
-        run_result['datasource'] = dict(name=ds.name, type=ds.type_name)
-        decorate_with_metadata(run_result)
+        overall_run_results['id'] = run_id
+        overall_run_results['created_at'] = datetime_to_str(created_at)
+        overall_run_results['datasource'] = dict(name=ds.name, type=ds.type_name)
+        decorate_with_metadata(overall_run_results)
 
         output_path = prepare_default_output_path(filesystem, created_at, ds)
         output_file = os.path.join(output_path, 'run.json')
 
         with open(output_file, 'w') as f:
-            f.write(json.dumps(run_result, separators=(',', ':')))
+            f.write(json.dumps(overall_run_results, separators=(',', ':')))
 
         if dbt_state_dir:
             abs_dir = os.path.abspath(dbt_state_dir)
@@ -697,9 +742,9 @@ class Runner():
         if skip_report:
             console.print(f'Results saved to {output if output else output_path}')
 
-        _analyse_and_log_run_event(run_result, assertion_results, dbt_test_results)
+        _analyse_and_log_run_event(overall_run_results, overall_assertion_results, dbt_test_results)
 
-        if not _check_test_status(assertion_results, assertion_exceptions, dbt_test_results):
+        if not _check_test_status(overall_assertion_results, overall_assertion_exceptions, dbt_test_results):
             return EC_ERR_TEST_FAILED
 
         return 0

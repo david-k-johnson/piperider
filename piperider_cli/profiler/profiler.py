@@ -23,10 +23,11 @@ HISTOGRAM_NUM_BUCKET = 50
 
 
 class ProfileSubject:
-    def __init__(self, name: str, schema: str = None, model: str = None):
+    def __init__(self, name: str, schema: str = None, model: str = None, database: str = None):
         self.table = name
         self.schema = schema
         self.alias = model
+        self.database = database
 
     def get_lower_schema(self):
         return self.schema.lower() if self.schema else None
@@ -805,7 +806,7 @@ class NumericColumnProfiler(BaseColumnProfiler):
                 if _variance is not None:
                     _stddev = math.sqrt(_variance)
             else:
-                columns.append(func.stddev(cte.c.c).label("_stddev"))
+                columns.append(func.stddev(func.cast(cte.c.c, Float)).label("_stddev"))
                 stmt = select(columns)
                 result = conn.execute(stmt).fetchone()
                 _total, _non_nulls, _valids, _zeros, _negatives, _distinct, _sum, _avg, _min, _max, _stddev = result
